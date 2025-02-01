@@ -1,20 +1,30 @@
-import concurrent
-import threading
-import asyncio
-import os
-from concurrent.futures import ThreadPoolExecutor
 import cv2
 import time
+import os
+import asyncio
+import multiprocessing
+from multiprocessing import Manager
 
 
-load_finished_event = threading.Event()
+def load_image_worker(filepath, shared_dict, lock):
+    try:
+        image = cv2.imread(filepath)
+        if image is None:
+            raise ValueError(f"Error loading {filepath}: Image could not be opened.")
+        filename = os.path.basename(filepath)
+        with lock:
+            shared_dict[filename] = image
+    except Exception as e:
+        print(f"Error loading {filepath}: {e}")
 
 
 class ImageManager:
     def __init__(self):
-        self.images = {}
-        self.lock = threading.Lock()
+        self.manager = Manager()
+        self.images = self.manager.dict()
+        self.lock = Manager().Lock()
         self.max_display_size = (800, 600)
+        self.simulate_only = True
 
     def load_image(self, filepath):
         try:
@@ -22,13 +32,7 @@ class ImageManager:
             if image is None:
                 raise ValueError(f"Error loading {filepath}: Image could not be opened.")
             filename = os.path.basename(filepath)
-
-            # Store the uncompressed image (NumPy array)
-            with self.lock:
-                self.images[filename] = {
-                    "compressed": image,  # The loaded image is already in NumPy array format
-                    "uncompressed": image
-                }
+            self.images[filename] = image
         except Exception as e:
             print(f"Error loading {filepath}: {e}")
 
@@ -37,13 +41,6 @@ class ImageManager:
                        if f.endswith((".jpg", ".jpeg"))]
         for filepath in image_files:
             self.load_image(filepath)
-
-    def load_images_background(self, folder_path):
-        image_files = [os.path.join(folder_path, f) for f in os.listdir(folder_path)
-                       if f.endswith((".jpg", ".jpeg"))]
-        with concurrent.futures.ThreadPoolExecutor() as executor:
-            executor.map(self.load_image, image_files)
-        load_finished_event.set()
 
     def resize_image(self, image):
         height, width = image.shape[:2]
@@ -57,88 +54,129 @@ class ImageManager:
 
         return cv2.resize(image, (new_width, new_height))
 
-    async def render_image(self, filename):
-        await asyncio.sleep(0)  # This allows the event loop to continue
+    def get_compressed_image(self, filename):
         if filename in self.images:
-            # print(f"Rendering {filename}...")
-            resized_image = self.resize_image(self.images[filename]["compressed"])
+            return self.images[filename]
+        else:
+            raise ValueError("Image not found.")
+
+    def display_image(self, filename):
+        self.flip_image(filename)
+        image = self.get_compressed_image(filename)
+        resized_image = self.resize_image(image)
+        if not self.simulate_only:
             cv2.imshow(filename, resized_image)
-            cv2.waitKey(2000)  # Display for 2000ms (2 seconds)
+            cv2.waitKey(1000)
             cv2.destroyAllWindows()
         else:
+            # simulating display time
+            time.sleep(1)
+
+    def load_images_parallel(self, folder_path):
+        image_files = [os.path.join(folder_path, f) for f in os.listdir(folder_path)
+                       if f.endswith((".jpg", ".jpeg"))]
+
+        processes = []
+        for filepath in image_files:
+            p = multiprocessing.Process(
+                target=load_image_worker,
+                args=(filepath, self.images, self.lock)
+            )
+            p.start()
+            processes.append(p)
+
+        for p in processes:
+            p.join()
+
+    def flip_image(self, filename, flip_code=-1):
+        if filename in self.images:
+            self.images[filename] = cv2.flip(self.images[filename], flip_code)
+        else:
             print(f"Image {filename} not found.")
+
+    async def render_image(self, filename):
+        try:
+            if filename in self.images:
+                self.flip_image(filename)
+                resized_image = self.resize_image(self.images[filename])
+                if not self.simulate_only:
+                    cv2.imshow(filename, resized_image)
+                    cv2.waitKey(1000)
+                    cv2.destroyAllWindows()
+                else:
+                    # simulating display time
+                    await asyncio.sleep(1)
+            else:
+                print(f"Image {filename} not found.")
+        except Exception as e:
+            print(f"Error rendering {filename}: {e}")
 
     async def render_images_list(self, file_list):
         tasks = [self.render_image(filename) for filename in file_list]
         await asyncio.gather(*tasks)
 
-    def get_compressed_image(self, filename):
-        if filename in self.images:
-            return self.images[filename]["compressed"]
-        else:
-            raise ValueError("Image not found.")
-
-    def display_image(self, filename):
-        image = self.get_compressed_image(filename)
-        resized_image = self.resize_image(image)
-        cv2.imshow(filename, resized_image)
-        cv2.waitKey(2000)
-        cv2.destroyAllWindows()
-
 
 def background_image_loader(image_manager, folder_path):
-    thread = threading.Thread(target=image_manager.load_images_background, args=(folder_path,))
-    thread.daemon = True  # Daemon thread will exit when main program exits
-    thread.start()
+    image_manager.load_images_parallel(folder_path)
 
 
 if __name__ == "__main__":
-    img_manager = ImageManager()
+    print("Starting the execution...")
+    to_print = False
+    NUM_RUNS = 10
+
+    speedup_render = []
+    speedup_total = []
+
     folder_path = "images/"
+    image_files = [f for f in os.listdir(folder_path) if f.endswith(('.jpg', '.jpeg'))]
+    image_list = []
+    for i, image_file in enumerate(image_files, start=1):
+        image_list.append(image_file)
 
-    example_image_1 = "cat.jpg"
-    example_image_2 = "leaf.jpg"
-    example_image_3 = "cloud.jpg"
+    for run in range(NUM_RUNS):
+        img_manager = ImageManager()
+        img_manager.simulate_only = True
 
-    # Sequential image loader
-    print("Starting sequential image loading...")
+        # SEQUENTIAL IMAGE LOADER
+        start_time_seq = time.time()
+        img_manager.load_images_sequential(folder_path)
+        start_render_seq = time.time()
+        for image in image_list:
+            img_manager.display_image(image)
+        end_render_seq = time.time()
+        end_time_seq = time.time()
+        time_sequential = end_time_seq - start_time_seq
+        if to_print:
+            print(f"Sequential rendering time: {end_render_seq - start_render_seq:.4f} seconds")
 
-    start_time_seq = time.time()
-    img_manager.load_images_sequential(folder_path)
+        # resetting the images dictionary
+        img_manager.images.clear()
 
-    start_render_seq = time.time()
-    img_manager.display_image(example_image_1)
-    img_manager.display_image(example_image_2)
-    img_manager.display_image(example_image_3)
-    end_render_seq = time.time()
-    print(f"Sequential rendering time: {end_render_seq - start_render_seq:.4f} seconds")
+        # PARALLEL IMAGE LOADER
+        start_time_par = time.time()
+        background_image_loader(img_manager, folder_path)
 
-    end_time_seq = time.time()
-    time_sequential = end_time_seq - start_time_seq
+        async def render_parallel_images():
+            start_render_par = time.time()
+            await img_manager.render_images_list(image_list)
+            end_render_par = time.time()
+            if to_print:
+                print(f"Parallel rendering time: {end_render_par - start_render_par:.4f} seconds")
+            su_render = (end_render_seq - start_render_seq) / (end_render_par - start_render_par)
+            speedup_render.append(su_render)
 
-    # Reset the images dictionary before running the parallel load
-    img_manager.images = {}
+        asyncio.run(render_parallel_images())
+        end_time_par = time.time()
+        time_parallel = end_time_par - start_time_par
+        img_manager.images.clear()
 
-    # Parallel image loader - multithreading for loading and asyncio for rendering
-    print("Starting parallel image loading...")
+        # comparison
+        if to_print:
+            print(f"Sequential time: {time_sequential:.4f} seconds")
+            print(f"Parallel time: {time_parallel:.4f} seconds")
 
-    # print("Starting background image loading...")
-    start_time_par = time.time()
-    background_image_loader(img_manager, folder_path)
-    load_finished_event.wait()
-
-    async def main():
-        start_render_par = time.time()
-        # print("Rendering a list of images asynchronously...")
-        await img_manager.render_images_list([example_image_1, example_image_2, example_image_3])
-        end_render_par = time.time()
-        print(f"Parallel rendering time: {end_render_par - start_render_par:.4f} seconds")
-
-    asyncio.run(main())
-    end_time_par = time.time()
-    time_parallel = end_time_par - start_time_par
-
-    # Comparison
-    print(f"Sequential time: {time_sequential:.4f} seconds")
-    print(f"Parallel time: {time_parallel:.4f} seconds")
+        speedup_total.append(time_sequential / time_parallel)
+    print(f"The render speedup is: {speedup_render}")
+    print(f"The total speedup is: {speedup_total}")
 
